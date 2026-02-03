@@ -1,40 +1,38 @@
 """
 Support for Unifi Status Units
 """
+
 from __future__ import annotations
 
 import logging
-from pprint import pprint
-from pprint import pformat
-import voluptuous as vol
+from pprint import pformat, pprint
 
-from homeassistant.components.switch import PLATFORM_SCHEMA, SwitchEntity
 import homeassistant.helpers.config_validation as cv
-from homeassistant.util import Throttle
-
+import voluptuous as vol
+from homeassistant.components.switch import PLATFORM_SCHEMA, SwitchEntity
 from homeassistant.const import (
-    CONF_NAME,
     CONF_HOST,
-    CONF_USERNAME,
+    CONF_NAME,
     CONF_PASSWORD,
     CONF_PORT,
+    CONF_USERNAME,
     CONF_VERIFY_SSL,
     STATE_OFF,
     STATE_ON,
-    STATE_UNKNOWN,
     STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
 )
+from homeassistant.util import Throttle
 
 from . import DOMAIN, PLATFORMS, __version__
-
 from .const import (
     CONF_SITE_ID,
     CONF_UNIFI_VERSION,
-    DEFAULT_NAME,
     DEFAULT_HOST,
+    DEFAULT_NAME,
     DEFAULT_PORT,
-    DEFAULT_UNIFI_VERSION,
     DEFAULT_SITE,
+    DEFAULT_UNIFI_VERSION,
     DEFAULT_VERIFY_SSL,
     MIN_TIME_BETWEEN_UPDATES,
 )
@@ -57,9 +55,30 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 )
 
 
+class UnifiSwitchData:
+    """Centralizes the get_aps() API call for all UniFi switches."""
+
+    def __init__(self, ctrl):
+        """Initialize the shared data object."""
+        self._ctrl = ctrl
+        self.aps = None
+
+    @Throttle(MIN_TIME_BETWEEN_UPDATES)
+    def update(self):
+        """Fetch device data from the controller."""
+        from .pyunifi.controller import APIError
+
+        try:
+            self.aps = self._ctrl.get_aps()
+            _LOGGER.debug(f"switch get_aps:\n{pformat(self.aps)}")
+        except APIError as ex:
+            _LOGGER.error(f"Update | Failed to scan aps: {ex}")
+            self.aps = None
+
+
 def setup_platform(hass, config, add_entities, discovery_info=None):
     """Set up the Unifi switch."""
-    from .pyunifi.controller import Controller, APIError
+    from .pyunifi.controller import APIError, Controller
 
     name = config.get(CONF_NAME)
     host = config.get(CONF_HOST)
@@ -84,48 +103,53 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
         _LOGGER.error(f"Setup | Failed to connect to Unifi Conroler: {ex}")
         return False
 
+    switch_data = UnifiSwitchData(ctrl)
+
     try:
         aps = ctrl.get_aps()
     except APIError as ex:
         _LOGGER.error(f"Setup | Failed to scan aps: {ex}")
-    else:
-        for device in aps:
-            if device.get("name"):
-                switch = device["name"]
-            else:
-                switch = device["ip"]
-            add_entities(
-                [
-                    UnifiStatusSwitch(
-                        hass, ctrl, f"{name} {switch} Restart", [device["device_id"], 0]
-                    )
-                ],
-                True,
+        return False
+
+    switches = []
+    for device in aps:
+        if device.get("name"):
+            switch = device["name"]
+        else:
+            switch = device["ip"]
+        switches.append(
+            UnifiStatusSwitch(
+                hass,
+                ctrl,
+                switch_data,
+                f"{name} {switch} Restart",
+                [device["device_id"], 0],
             )
-            if device.get("port_table"):
-                for port in device["port_table"]:
-                    if port.get("port_poe") == True:
-                        _LOGGER.debug(f"Setup | !!! {switch} {port['name']}")
-                        add_entities(
-                            [
-                                UnifiStatusSwitch(
-                                    hass,
-                                    ctrl,
-                                    f"{name} {switch} PoE {port['name']}",
-                                    [device["device_id"], port["port_idx"]],
-                                )
-                            ],
-                            True,
+        )
+        if device.get("port_table"):
+            for port in device["port_table"]:
+                if port.get("port_poe") == True:
+                    _LOGGER.debug(f"Setup | !!! {switch} {port['name']}")
+                    switches.append(
+                        UnifiStatusSwitch(
+                            hass,
+                            ctrl,
+                            switch_data,
+                            f"{name} {switch} PoE {port['name']}",
+                            [device["device_id"], port["port_idx"]],
                         )
+                    )
+    add_entities(switches, True)
 
 
 class UnifiStatusSwitch(SwitchEntity):
     """Implementation of a UniFi Status switch."""
 
-    def __init__(self, hass, ctrl, name, switch_id):
+    def __init__(self, hass, ctrl, switch_data, name, switch_id):
         """Initialize the switch."""
         self._hass = hass
         self._ctrl = ctrl
+        self._switch_data = switch_data
         self._name = name
         self._dev_id = switch_id[0]
         self._port_id = switch_id[1]
@@ -180,66 +204,61 @@ class UnifiStatusSwitch(SwitchEntity):
         """Return the device state attributes."""
         return self._attributes
 
-    @Throttle(MIN_TIME_BETWEEN_UPDATES)
     def update(self):
         """Set up the switch."""
-        from .pyunifi.controller import APIError
+        self._switch_data.update()
 
-        try:
-            aps = self._ctrl.get_aps()
-        except APIError as ex:
-            _LOGGER.error(f"Update | Failed to scan aps: {ex}")
-        else:
-            _LOGGER.debug(f"switch get_aps:\n{pformat(aps)}")
-            for device in aps:
-                if self._dev_id == device["device_id"] and self._port_id == 0:
-                    self._mac = device["mac"]
-                    self._attributes["model"] = device["model"]
-                    self._attributes["serial"] = device["serial"]
-                    self._attributes["version"] = device["version"]
-                    self._attributes["ip"] = device["ip"]
-                    self._attributes["mac"] = device["mac"]
+        if self._switch_data.aps is None:
+            self._state = STATE_UNAVAILABLE
+            return
 
-                    if device.get("uptime"):
-                        self._attributes["uptime"] = device["uptime"]
+        for device in self._switch_data.aps:
+            if self._dev_id == device["device_id"] and self._port_id == 0:
+                self._mac = device["mac"]
+                self._attributes["model"] = device["model"]
+                self._attributes["serial"] = device["serial"]
+                self._attributes["version"] = device["version"]
+                self._attributes["ip"] = device["ip"]
+                self._attributes["mac"] = device["mac"]
 
-                    if device["state"] in [1, 4, 5, 6]:
-                        self._state = STATE_OFF
-                    else:
-                        _LOGGER.debug(
-                            f"Update | set state unavail {self._dev_id} {self._port_id}"
-                        )
+                if device.get("uptime"):
+                    self._attributes["uptime"] = device["uptime"]
+
+                if device["state"] in [1, 4, 5, 6]:
+                    self._state = STATE_OFF
+                else:
+                    _LOGGER.debug(
+                        f"Update | set state unavail {self._dev_id} {self._port_id}"
+                    )
+                    self._state = STATE_UNAVAILABLE
+
+            elif self._dev_id == device["device_id"] and self._port_id != 0:
+                self._attributes = {}
+                _LOGGER.debug(f"port index : {self._port_id} {type(self._port_id)}")
+                if device["state"] in [1, 4, 5, 6]:
+                    try:
+                        for port in device["port_table"]:
+                            if port["port_idx"] == self._port_id:
+                                self._mac = device["mac"]
+                                if port["poe_mode"] == "auto":
+                                    self._state = STATE_ON
+                                    self._attributes["poe_voltage"] = port[
+                                        "poe_voltage"
+                                    ]
+                                    self._attributes["poe_current"] = port[
+                                        "poe_current"
+                                    ]
+                                    self._attributes["poe_power"] = port["poe_power"]
+                                else:
+                                    self._state = STATE_OFF
+                    except Exception as ex:
                         self._state = STATE_UNAVAILABLE
-
-                elif self._dev_id == device["device_id"] and self._port_id != 0:
-                    self._attributes = {}
-                    _LOGGER.debug(f"port index : {self._port_id} {type(self._port_id)}")
-                    if device["state"] in [1, 4, 5, 6]:
-                        try:
-                            for port in device["port_table"]:
-                                if port["port_idx"] == self._port_id:
-                                    self._mac = device["mac"]
-                                    if port["poe_mode"] == "auto":
-                                        self._state = STATE_ON
-                                        self._attributes["poe_voltage"] = port[
-                                            "poe_voltage"
-                                        ]
-                                        self._attributes["poe_current"] = port[
-                                            "poe_current"
-                                        ]
-                                        self._attributes["poe_power"] = port[
-                                            "poe_power"
-                                        ]
-                                    else:
-                                        self._state = STATE_OFF
-                        except Exception as ex:
-                            self._state = STATE_UNAVAILABLE
-                            _LOGGER.error(f"Update | Failed detect port status: {ex}")
-                    else:
-                        _LOGGER.debug(
-                            f"Update | set state unavail did {self._dev_id} pid {self._port_id} state {device['state']}"
-                        )
-                        self._state = STATE_UNAVAILABLE
+                        _LOGGER.error(f"Update | Failed detect port status: {ex}")
+                else:
+                    _LOGGER.debug(
+                        f"Update | set state unavail did {self._dev_id} pid {self._port_id} state {device['state']}"
+                    )
+                    self._state = STATE_UNAVAILABLE
 
         _LOGGER.debug(f"end of update {self._dev_id} {self._port_id}")
 

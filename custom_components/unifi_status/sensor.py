@@ -1,37 +1,36 @@
 """
 Support for Unifi Status Units.
 """
+
 from __future__ import annotations
 
 import logging
-from pprint import pprint
-from pprint import pformat
-import voluptuous as vol
+from pprint import pformat, pprint
 
-from homeassistant.helpers.entity import Entity
 import homeassistant.helpers.config_validation as cv
-from homeassistant.util import Throttle
+import voluptuous as vol
 from homeassistant.components.sensor import PLATFORM_SCHEMA
 from homeassistant.const import (
-    CONF_NAME,
     CONF_HOST,
-    CONF_USERNAME,
-    CONF_PORT,
-    CONF_PASSWORD,
     CONF_MONITORED_CONDITIONS,
+    CONF_NAME,
+    CONF_PASSWORD,
+    CONF_PORT,
+    CONF_USERNAME,
     CONF_VERIFY_SSL,
 )
+from homeassistant.helpers.entity import Entity
+from homeassistant.util import Throttle
 
 from . import DOMAIN, PLATFORMS, __version__
-
 from .const import (
     CONF_SITE_ID,
     CONF_UNIFI_VERSION,
-    DEFAULT_NAME,
     DEFAULT_HOST,
+    DEFAULT_NAME,
     DEFAULT_PORT,
-    DEFAULT_UNIFI_VERSION,
     DEFAULT_SITE,
+    DEFAULT_UNIFI_VERSION,
     DEFAULT_VERIFY_SSL,
     MIN_TIME_BETWEEN_UPDATES,
 )
@@ -86,9 +85,45 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 )
 
 
+class UnifiSensorData:
+    """Centralizes API calls for all UniFi sensors."""
+
+    def __init__(self, ctrl):
+        """Initialize the shared data object."""
+        self._ctrl = ctrl
+        self.healthinfo = None
+        self.alerts = None
+        self.aps = None
+
+    @Throttle(MIN_TIME_BETWEEN_UPDATES)
+    def update(self):
+        """Fetch all data from the controller in a single cycle."""
+        from .pyunifi.controller import APIError
+
+        try:
+            self.healthinfo = self._ctrl.get_healthinfo()
+            _LOGGER.debug(f"get_healthinfo:\n{pformat(self.healthinfo)}")
+        except APIError as ex:
+            _LOGGER.error(f"Failed to access health info: {ex}")
+            self.healthinfo = None
+
+        try:
+            self.alerts = self._ctrl.get_alerts()
+        except APIError as ex:
+            _LOGGER.error(f"Failed to access alerts info: {ex}")
+            self.alerts = None
+
+        try:
+            self.aps = self._ctrl.get_aps()
+            _LOGGER.debug(f"get_aps:\n{pformat(self.aps)}")
+        except APIError as ex:
+            _LOGGER.error(f"Failed to scan aps: {ex}")
+            self.aps = None
+
+
 def setup_platform(hass, config, add_entities, discovery_info=None):
     """Set up the Unifi sensor."""
-    from .pyunifi.controller import Controller, APIError
+    from .pyunifi.controller import APIError, Controller
 
     name = config.get(CONF_NAME)
     host = config.get(CONF_HOST)
@@ -113,17 +148,21 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
         _LOGGER.error(f"Failed to connect to Unifi Controler: {ex}")
         return False
 
+    sensor_data = UnifiSensorData(ctrl)
+
+    sensors = []
     for sensor in config.get(CONF_MONITORED_CONDITIONS):
-        add_entities([UnifiStatusSensor(hass, ctrl, name, sensor)], True)
+        sensors.append(UnifiStatusSensor(hass, sensor_data, name, sensor))
+    add_entities(sensors, True)
 
 
 class UnifiStatusSensor(Entity):
     """Implementation of a UniFi Status sensor."""
 
-    def __init__(self, hass, ctrl, name, sensor):
+    def __init__(self, hass, sensor_data, name, sensor):
         """Initialize the sensor."""
         self._hass = hass
-        self._ctrl = ctrl
+        self._sensor_data = sensor_data
         self._name = name + " " + USG_SENSORS[sensor][0]
         self._sensor = sensor
         self._state = None
@@ -151,61 +190,49 @@ class UnifiStatusSensor(Entity):
         """Return the device state attributes."""
         return self._attributes
 
-    @Throttle(MIN_TIME_BETWEEN_UPDATES)
     def update(self):
         """Set up the sensor."""
-        from .pyunifi.controller import APIError
+        self._sensor_data.update()
 
         if self._sensor == SENSOR_ALERTS:
             self._attributes = {}
 
-            try:
-                unarchived_alerts = self._ctrl.get_alerts()
-            except APIError as ex:
-                _LOGGER.error(f"Failed to access alerts info: {ex}")
-            else:
-                for index, alert in enumerate(unarchived_alerts, start=1):
-                    if not alert["archived"]:
-                        self._attributes[str(index)] = alert
+            if self._sensor_data.alerts is None:
+                self._state = None
+                return
 
-                self._state = len(self._attributes)
+            for index, alert in enumerate(self._sensor_data.alerts, start=1):
+                if not alert["archived"]:
+                    self._attributes[str(index)] = alert
+
+            self._state = len(self._attributes)
 
         elif self._sensor == SENSOR_FIRMWARE:
             self._attributes = {}
             self._state = 0
 
-            try:
-                aps = self._ctrl.get_aps()
-            except APIError as ex:
-                _LOGGER.error(f"Failed to scan aps: {ex}")
-            else:
-                _LOGGER.debug(f"get_aps:\n{pformat(aps)}")
-                # Set the attributes based on device name - this may not be unique
-                # but is user-readability preferred
-                for devices in aps:
-                    if devices.get("upgradable"):
-                        if devices.get("name"):
-                            self._attributes[devices["name"]] = devices["upgradable"]
-                        else:
-                            self._attributes[devices["ip"]] = devices["upgradable"]
-                        self._state += 1
+            if self._sensor_data.aps is None:
+                self._state = None
+                return
+
+            for devices in self._sensor_data.aps:
+                if devices.get("upgradable"):
+                    if devices.get("name"):
+                        self._attributes[devices["name"]] = devices["upgradable"]
+                    else:
+                        self._attributes[devices["ip"]] = devices["upgradable"]
+                    self._state += 1
 
         else:
-            # get_healthinfo() call made for each of 4 sensors - should only be for 1
-            try:
-                # Check that function exists...potential errors on startup otherwise
-                if hasattr(self._ctrl, "get_healthinfo"):
-                    self._alldata = self._ctrl.get_healthinfo()
-                    _LOGGER.debug(f"get_healthinfo:\n{pformat(self._alldata)}")
+            if self._sensor_data.healthinfo is None:
+                self._state = None
+                self._attributes = {}
+                return
 
-                    for sub in self._alldata:
-                        if sub["subsystem"] == self._sensor:
-                            self._data = sub
-                            self._state = sub["status"].upper()
-                            for attr in sub:
-                                self._attributes[attr] = sub[attr]
-
-                else:
-                    _LOGGER.error("no healthinfo attribute for controller")
-            except APIError as ex:
-                _LOGGER.error(f"Failed to access health info: {ex}")
+            self._alldata = self._sensor_data.healthinfo
+            for sub in self._alldata:
+                if sub["subsystem"] == self._sensor:
+                    self._data = sub
+                    self._state = sub["status"].upper()
+                    for attr in sub:
+                        self._attributes[attr] = sub[attr]
