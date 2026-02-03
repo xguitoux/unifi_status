@@ -85,6 +85,147 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 )
 
 
+def _format_uptime(seconds):
+    """Format an uptime value in seconds to a human-readable string."""
+    time = int(seconds)
+    if time < 60:
+        return "Less than 1 min"
+    days = time // 86400
+    hours = (time % 86400) // 3600
+    minutes = (time % 3600) // 60
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0:
+        parts.append(f"{hours}hr")
+    if minutes > 0:
+        parts.append(f"{minutes}min")
+    return " ".join(parts)
+
+
+DERIVED_SENSORS = [
+    # --- WAN-derived sensors ---
+    {
+        "name": "UDM CPU",
+        "unique_id": "unifi_status_wan_cpu",
+        "source": SENSOR_WAN,
+        "unit": "%",
+        "icon": None,
+        "value_fn": lambda a: (a.get("gw_system-stats") or {}).get("cpu", 0),
+    },
+    {
+        "name": "UDM Memory",
+        "unique_id": "unifi_status_wan_mem",
+        "source": SENSOR_WAN,
+        "unit": "%",
+        "icon": None,
+        "value_fn": lambda a: (a.get("gw_system-stats") or {}).get("mem", 0),
+    },
+    {
+        "name": "WAN IP",
+        "unique_id": "unifi_status_wan_ip",
+        "source": SENSOR_WAN,
+        "unit": None,
+        "icon": None,
+        "value_fn": lambda a: a.get("wan_ip"),
+    },
+    {
+        "name": "WAN Download",
+        "unique_id": "unifi_status_wan_download",
+        "source": SENSOR_WAN,
+        "unit": "Kbps",
+        "icon": "mdi:progress-download",
+        "value_fn": lambda a: int((a.get("rx_bytes-r") or 0) / 1024),
+    },
+    {
+        "name": "WAN Upload",
+        "unique_id": "unifi_status_wan_upload",
+        "source": SENSOR_WAN,
+        "unit": "Kbps",
+        "icon": "mdi:progress-upload",
+        "value_fn": lambda a: int((a.get("tx_bytes-r") or 0) / 1024),
+    },
+    {
+        "name": "UDM Uptime",
+        "unique_id": "unifi_status_wan_uptime",
+        "source": SENSOR_WAN,
+        "unit": None,
+        "icon": None,
+        "value_fn": lambda a: _format_uptime(
+            (a.get("gw_system-stats") or {}).get("uptime", 0)
+        ),
+    },
+    {
+        "name": "UDM Firmware Version",
+        "unique_id": "unifi_status_firmware_version",
+        "source": SENSOR_WAN,
+        "unit": None,
+        "icon": "mdi:database-plus",
+        "value_fn": lambda a: a.get("gw_version"),
+    },
+    # --- WWW-derived sensors ---
+    {
+        "name": "UDM Speedtest Download",
+        "unique_id": "unifi_status_www_xput_down",
+        "source": SENSOR_WWW,
+        "unit": "Mbps",
+        "icon": "mdi:progress-download",
+        "value_fn": lambda a: a.get("xput_down"),
+    },
+    {
+        "name": "UDM Speedtest Upload",
+        "unique_id": "unifi_status_www_xput_up",
+        "source": SENSOR_WWW,
+        "unit": "Mbps",
+        "icon": "mdi:progress-upload",
+        "value_fn": lambda a: a.get("xput_up"),
+    },
+    {
+        "name": "UDM Speedtest Ping",
+        "unique_id": "unifi_status_www_speedtest_ping",
+        "source": SENSOR_WWW,
+        "unit": "ms",
+        "icon": "mdi:progress-clock",
+        "value_fn": lambda a: a.get("speedtest_ping"),
+    },
+    {
+        "name": "Internet Uptime",
+        "unique_id": "unifi_status_www_uptime",
+        "source": SENSOR_WWW,
+        "unit": None,
+        "icon": None,
+        "value_fn": lambda a: _format_uptime(a.get("uptime", 0)),
+    },
+    # --- WLAN-derived sensor ---
+    {
+        "name": "Users Wifi",
+        "unique_id": "unifi_status_wlan_num_user",
+        "source": SENSOR_WLAN,
+        "unit": None,
+        "icon": "mdi:account-multiple",
+        "value_fn": lambda a: a.get("num_user"),
+    },
+    # --- LAN-derived sensor ---
+    {
+        "name": "Users Lan",
+        "unique_id": "unifi_status_lan_num_user",
+        "source": SENSOR_LAN,
+        "unit": None,
+        "icon": "mdi:account-multiple",
+        "value_fn": lambda a: a.get("num_user"),
+    },
+    # --- Alerts-derived sensor ---
+    {
+        "name": "Last Alert",
+        "unique_id": "unifi_status_last_alert",
+        "source": SENSOR_ALERTS,
+        "unit": None,
+        "icon": "mdi:alert-outline",
+        "value_fn": lambda a: (a.get("1") or {}).get("msg", "Aucune alerte"),
+    },
+]
+
+
 class UnifiSensorData:
     """Centralizes API calls for all UniFi sensors."""
 
@@ -151,8 +292,14 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
     sensor_data = UnifiSensorData(ctrl)
 
     sensors = []
-    for sensor in config.get(CONF_MONITORED_CONDITIONS):
+    monitored = config.get(CONF_MONITORED_CONDITIONS)
+    for sensor in monitored:
         sensors.append(UnifiStatusSensor(hass, sensor_data, name, sensor))
+
+    for derived_cfg in DERIVED_SENSORS:
+        if derived_cfg["source"] in monitored:
+            sensors.append(UnifiDerivedSensor(hass, sensor_data, name, derived_cfg))
+
     add_entities(sensors, True)
 
 
@@ -236,3 +383,73 @@ class UnifiStatusSensor(Entity):
                     self._state = sub["status"].upper()
                     for attr in sub:
                         self._attributes[attr] = sub[attr]
+
+
+class UnifiDerivedSensor(Entity):
+    """Implementation of a derived UniFi sensor that extracts a value from a base sensor's attributes."""
+
+    def __init__(self, hass, sensor_data, name, config):
+        """Initialize the derived sensor."""
+        self._hass = hass
+        self._sensor_data = sensor_data
+        self._name = name + " " + config["name"]
+        self._unique_id = config["unique_id"]
+        self._source = config["source"]
+        self._unit = config.get("unit")
+        self._icon_str = config.get("icon")
+        self._value_fn = config["value_fn"]
+        self._state = None
+
+    @property
+    def name(self):
+        """Return the name of the sensor."""
+        return self._name
+
+    @property
+    def unique_id(self):
+        """Return a unique ID for the sensor."""
+        return self._unique_id
+
+    @property
+    def icon(self):
+        """Icon to use in the frontend, if any."""
+        return self._icon_str
+
+    @property
+    def unit_of_measurement(self):
+        """Return the unit of measurement."""
+        return self._unit
+
+    @property
+    def state(self):
+        """Return the state of the sensor."""
+        return self._state
+
+    def update(self):
+        """Update the derived sensor from shared data."""
+        self._sensor_data.update()
+        attrs = self._get_source_attributes()
+        if attrs is None:
+            self._state = None
+            return
+        try:
+            self._state = self._value_fn(attrs)
+        except (KeyError, TypeError, ValueError):
+            self._state = None
+
+    def _get_source_attributes(self):
+        """Retrieve the attributes dict from the source sensor's data."""
+        if self._source == SENSOR_ALERTS:
+            if self._sensor_data.alerts is None:
+                return None
+            attrs = {}
+            for i, alert in enumerate(self._sensor_data.alerts, start=1):
+                if not alert.get("archived"):
+                    attrs[str(i)] = alert
+            return attrs
+        if self._sensor_data.healthinfo is None:
+            return None
+        for sub in self._sensor_data.healthinfo:
+            if sub.get("subsystem") == self._source:
+                return sub
+        return None
