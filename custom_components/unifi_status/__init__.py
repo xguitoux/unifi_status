@@ -1,11 +1,47 @@
-"""
-Support for Unifi Status Units.
-
-"""
+"""UniFi Status integration."""
 
 from __future__ import annotations
 
-DOMAIN = "unifi_status"
-PLATFORMS = ["sensor", "switch"]
+import logging
 
-__version__ = "0.4.0"
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+
+from .const import DOMAIN
+from .coordinator import UnifiStatusCoordinator
+
+_LOGGER = logging.getLogger(__name__)
+
+__version__ = "0.5.0"
+
+PLATFORMS = [Platform.SENSOR, Platform.SWITCH]
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up UniFi Status from a config entry."""
+    coordinator = UnifiStatusCoordinator(hass, entry)
+    await coordinator.async_setup()
+    await coordinator.async_config_entry_first_refresh()
+
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN][entry.entry_id] = coordinator
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
+    return True
+
+
+async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Handle options update — reload the integration."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unload_ok:
+        hass.data[DOMAIN].pop(entry.entry_id)
+    return unload_ok
