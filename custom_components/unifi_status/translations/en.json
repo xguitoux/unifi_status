@@ -1,0 +1,37 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to UniFi Controller",
+        "description": "Enter your UniFi Controller connection details.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "username": "Username",
+          "password": "Password",
+          "site_id": "Site ID",
+          "version": "Controller Version",
+          "verify_ssl": "Verify SSL Certificate"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the UniFi Controller",
+      "invalid_auth": "Invalid username or password",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This controller and site are already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "UniFi Status Options",
+        "data": {
+          "monitored_conditions": "Monitored subsystems"
+        }
+      }
+    }
+  }
+}
