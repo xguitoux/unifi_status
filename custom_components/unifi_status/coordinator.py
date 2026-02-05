@@ -27,6 +27,8 @@ from .pyunifi.controller import APIError, Controller
 
 _LOGGER = logging.getLogger(__name__)
 
+MAX_CONSECUTIVE_FAILURES = 3
+
 
 class UnifiStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator to manage fetching UniFi data."""
@@ -43,13 +45,25 @@ class UnifiStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=UPDATE_INTERVAL,
         )
         self.ctrl: Controller | None = None
+        self._consecutive_failures = 0
 
     async def async_setup(self) -> None:
         """Create the controller connection."""
+        await self._async_create_controller()
+
+    async def _async_create_controller(self) -> None:
+        """Create or recreate the controller connection."""
         data = self.config_entry.data
+        # Close existing controller if any
+        if self.ctrl is not None:
+            try:
+                await self.hass.async_add_executor_job(self.ctrl._logout_safe)
+            except Exception:
+                pass
         self.ctrl = await self.hass.async_add_executor_job(
             self._create_controller, data
         )
+        self._consecutive_failures = 0
 
     @staticmethod
     def _create_controller(data: dict[str, Any]) -> Controller:
@@ -68,14 +82,42 @@ class UnifiStatusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Fetch data from the UniFi controller."""
         if self.ctrl is None:
             raise UpdateFailed("Controller not initialized")
+
         try:
             healthinfo, alerts, aps = await self.hass.async_add_executor_job(
                 self._fetch_all
             )
+            # Success - reset failure counter
+            self._consecutive_failures = 0
         except APIError as err:
-            raise UpdateFailed(
-                f"Error communicating with UniFi controller: {err}"
-            ) from err
+            self._consecutive_failures += 1
+            _LOGGER.warning(
+                "UniFi API error (failure %d/%d): %s",
+                self._consecutive_failures,
+                MAX_CONSECUTIVE_FAILURES,
+                err,
+            )
+
+            # If too many consecutive failures, recreate the controller
+            if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                _LOGGER.warning(
+                    "Too many consecutive failures, recreating controller connection"
+                )
+                try:
+                    await self._async_create_controller()
+                    # Try one more time with the new controller
+                    healthinfo, alerts, aps = await self.hass.async_add_executor_job(
+                        self._fetch_all
+                    )
+                    self._consecutive_failures = 0
+                except Exception as retry_err:
+                    raise UpdateFailed(
+                        f"Failed after controller recreation: {retry_err}"
+                    ) from retry_err
+            else:
+                raise UpdateFailed(
+                    f"Error communicating with UniFi controller: {err}"
+                ) from err
 
         return {
             "healthinfo": healthinfo or [],

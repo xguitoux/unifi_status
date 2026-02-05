@@ -29,15 +29,33 @@ def retry_login(func, *args, **kwargs):  # pylint: disable=w0613
     def wrapper(*args, **kwargs):
         controller = args[0]
         with controller._lock:
-            try:
+            last_err = None
+            for attempt in range(3):
                 try:
                     return func(*args, **kwargs)
                 except (requests.exceptions.RequestException, APIError) as err:
-                    CONS_LOG.warning("Failed to perform %s due to %s", func, err)
-                    controller._login()  # pylint: disable=w0212
-                    return func(*args, **kwargs)
-            except Exception as err:
-                raise APIError(err)
+                    last_err = err
+                    CONS_LOG.warning(
+                        "Attempt %d failed for %s due to %s, re-authenticating...",
+                        attempt + 1, func.__name__, err
+                    )
+                    try:
+                        controller._logout_safe()
+                        controller._login()
+                    except Exception as login_err:
+                        CONS_LOG.warning("Re-login failed: %s", login_err)
+                except Exception as err:
+                    last_err = err
+                    CONS_LOG.warning(
+                        "Attempt %d failed for %s with unexpected error: %s",
+                        attempt + 1, func.__name__, err
+                    )
+                    try:
+                        controller._logout_safe()
+                        controller._login()
+                    except Exception as login_err:
+                        CONS_LOG.warning("Re-login failed: %s", login_err)
+            raise APIError(f"Failed after 3 attempts: {last_err}")
 
     return wrapper
 
@@ -116,7 +134,17 @@ class Controller:  # pylint: disable=R0902,R0904
 
     @staticmethod
     def _jsondec(data):
-        obj = json.loads(data)
+        try:
+            obj = json.loads(data)
+        except json.JSONDecodeError as err:
+            # Session might be expired, server returned HTML or error string
+            if "login" in data.lower() or "unauthorized" in data.lower():
+                raise APIError("Session expired - login required")
+            raise APIError(f"Invalid JSON response: {err}")
+
+        if not isinstance(obj, dict):
+            raise APIError(f"Unexpected response type: {type(obj).__name__}")
+
         if "meta" in obj:
             if obj["meta"]["rc"] != "ok":
                 raise APIError(obj["meta"]["msg"])
@@ -200,6 +228,17 @@ class Controller:  # pylint: disable=R0902,R0904
         self.log.debug("logout()")
         self._api_write("logout")
         self.session.close()
+
+    def _logout_safe(self):
+        """Safely close session without API call (for use when session may be invalid)."""
+        self.log.debug("_logout_safe()")
+        if hasattr(self, "session") and self.session is not None:
+            try:
+                self.session.close()
+            except Exception:
+                pass
+        self.session = None
+        self.headers = None
 
     def switch_site(self, name):
         """

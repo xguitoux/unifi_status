@@ -13,7 +13,7 @@ from .coordinator import UnifiStatusCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 PLATFORMS = [Platform.SENSOR, Platform.SWITCH]
 
